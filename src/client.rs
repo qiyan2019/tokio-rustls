@@ -6,8 +6,6 @@ use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::windows::io::{AsRawSocket, RawSocket};
 use std::pin::Pin;
 use std::sync::Arc;
-#[cfg(feature = "early-data")]
-use std::task::Waker;
 use std::task::{Context, Poll};
 
 use rustls::pki_types::ServerName;
@@ -107,9 +105,6 @@ impl TlsConnector {
 
             need_flush: false,
             error: None,
-
-            #[cfg(feature = "early-data")]
-            early_waker: None,
 
             session,
         }))
@@ -239,9 +234,6 @@ pub struct TlsStream<IO> {
     pub(crate) need_flush: bool,
     /// Buffered error that occurred during batch reading
     pub(crate) error: Option<io::Error>,
-
-    #[cfg(feature = "early-data")]
-    pub(crate) early_waker: Option<Waker>,
 }
 
 impl<IO> TlsStream<IO> {
@@ -306,29 +298,6 @@ impl<IO> IoSession for TlsStream<IO> {
     }
 }
 
-#[cfg(feature = "early-data")]
-impl<IO> TlsStream<IO>
-where
-    IO: AsyncRead + AsyncWrite + Unpin,
-{
-    fn poll_early_data(&mut self, cx: &mut Context<'_>) {
-        // In the EarlyData state, we have not really established a Tls connection.
-        // Before writing data through `AsyncWrite` and completing the tls handshake,
-        // we ignore read readiness and return to pending.
-        //
-        // In order to avoid event loss,
-        // we need to register a waker and wake it up after tls is connected.
-        if self
-            .early_waker
-            .as_ref()
-            .filter(|waker| cx.waker().will_wake(waker))
-            .is_none()
-        {
-            self.early_waker = Some(cx.waker().clone());
-        }
-    }
-}
-
 impl<IO> AsyncRead for TlsStream<IO>
 where
     IO: AsyncRead + AsyncWrite + Unpin,
@@ -375,8 +344,11 @@ where
         match self.state {
             #[cfg(feature = "early-data")]
             TlsState::EarlyData(..) => {
-                self.get_mut().poll_early_data(cx);
-                Poll::Pending
+                // 0-RTT 状态下读之前先完成握手（flush 会推进握手并在必要时重发 early data），
+                // 完成后状态已变为 Stream，再进入正常读取路径
+                let mut this = self;
+                ready!(this.as_mut().poll_flush(cx))?;
+                this.poll_fill_buf(cx)
             }
             TlsState::Stream | TlsState::WriteShutdown => {
                 let this = self.get_mut();
@@ -426,13 +398,7 @@ where
         #[cfg(feature = "early-data")]
         {
             let bufs = [io::IoSlice::new(buf)];
-            let written = poll_handle_early_data(
-                &mut this.state,
-                &mut stream,
-                &mut this.early_waker,
-                cx,
-                &bufs,
-            )?;
+            let written = poll_handle_early_data(&mut this.state, &mut stream, cx, &bufs)?;
             match written {
                 Poll::Ready(0) => {}
                 Poll::Ready(written) => return Poll::Ready(Ok(written)),
@@ -460,13 +426,7 @@ where
 
         #[cfg(feature = "early-data")]
         {
-            let written = poll_handle_early_data(
-                &mut this.state,
-                &mut stream,
-                &mut this.early_waker,
-                cx,
-                bufs,
-            )?;
+            let written = poll_handle_early_data(&mut this.state, &mut stream, cx, bufs)?;
             match written {
                 Poll::Ready(0) => {}
                 Poll::Ready(written) => return Poll::Ready(Ok(written)),
@@ -493,13 +453,7 @@ where
 
         #[cfg(feature = "early-data")]
         {
-            let written = poll_handle_early_data(
-                &mut this.state,
-                &mut stream,
-                &mut this.early_waker,
-                cx,
-                &[],
-            )?;
+            let written = poll_handle_early_data(&mut this.state, &mut stream, cx, &[])?;
             if written.is_pending() {
                 this.need_flush = stream.need_flush;
                 return Poll::Pending;
@@ -534,7 +488,6 @@ where
 fn poll_handle_early_data<IO>(
     state: &mut TlsState,
     stream: &mut Stream<IO, ClientConnection>,
-    early_waker: &mut Option<Waker>,
     cx: &mut Context<'_>,
     bufs: &[io::IoSlice<'_>],
 ) -> Poll<io::Result<usize>>
@@ -587,10 +540,6 @@ where
 
         // end
         *state = TlsState::Stream;
-
-        if let Some(waker) = early_waker.take() {
-            waker.wake();
-        }
     }
 
     Poll::Ready(Ok(0))
